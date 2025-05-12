@@ -1,56 +1,103 @@
+import argparse
 import os
-import numpy as np
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.preprocessing import image
+import cv2
+import numpy as np
+import sys
 
-# --- Configuration ---
-MODEL_PATH = 'data/keras_model.h5'
-LABELS_PATH = 'data/labels.txt'   # Ensure labels.txt is in same directory as model
-IMAGE_PATH = 'testimages/images.jpg'
+# Suppress TensorFlow logs
+tf.get_logger().setLevel('ERROR')
 
-# --- Debugging: Check if the model file exists at the specified path ---
-print(f"Checking if model file exists at: {MODEL_PATH}")
-if not os.path.exists(MODEL_PATH):
-    print(f"Error: Model file NOT found at {MODEL_PATH}")
-    print("Please double-check the path and ensure the file is there.")
-    exit()
-else:
-    print(f"Model file found at {MODEL_PATH}")
+# ===== Monkey-patch to handle legacy 'groups' arg in DepthwiseConv2D configs =====
+from tensorflow.keras.layers import DepthwiseConv2D as _BaseDepthwiseConv2D
 
-# --- Load labels ---
-if not os.path.exists(LABELS_PATH):
-    print(f"Error: Labels file NOT found at {LABELS_PATH}")
-    print("Please double-check the path and ensure the file is there.")
-    exit()
-with open(LABELS_PATH, "r") as f:
-    labels = [line.strip() for line in f.readlines()]
+_orig_dc2d_init = _BaseDepthwiseConv2D.__init__
+def _patched_dc2d_init(self, *args, groups=None, **kwargs):
+    # Drop 'groups' if present (legacy from older Keras versions)
+    if 'groups' in kwargs:
+        kwargs.pop('groups')
+    _orig_dc2d_init(self, *args, **kwargs)
+_BaseDepthwiseConv2D.__init__ = _patched_dc2d_init
 
-model = keras.models.load_model(MODEL_PATH)
-# Infer required input size from the model
-input_shape = model.input_shape
-if isinstance(input_shape, list):  # For multi-input models
-    input_shape = input_shape[0]
-img_height, img_width = input_shape[1], input_shape[2]
-img = image.load_img(IMAGE_PATH, target_size=(img_height, img_width))
-img_array = image.img_to_array(img)
-img_array = np.expand_dims(img_array, axis=0)
-img_array = img_array / 255.0  # Normalize; adjust if your model expects something different
+_orig_dc2d_from_config = _BaseDepthwiseConv2D.from_config
+@classmethod
+def _patched_dc2d_from_config(cls, config):
+    # Remove 'groups' before deserialization
+    config.pop('groups', None)
+    return _orig_dc2d_from_config(config)
+_BaseDepthwiseConv2D.from_config = _patched_dc2d_from_config
+# =====================================================================================
 
-# --- Predict ---
-preds = model.predict(img_array)
-preds = preds[0]  # Remove batch dimension
 
-# Sort and print results
-results = sorted(
-    [{"label": labels[i], "confidence": float(conf)}
-        for i, conf in enumerate(preds)],
-    key=lambda x: x["confidence"],
-    reverse=True
-)
-print(f"\nClassification results for {IMAGE_PATH}:")
-for result in results:
-    print(f"  Label: {result['label']}, Confidence: {result['confidence']:.4f}")
+def load_labels(label_path):
+    with open(label_path, 'r') as f:
+        return [line.strip() for line in f if line.strip()]
 
-if results:
-    print(f"\nTop Prediction: {results[0]['label']} with confidence {results[0]['confidence']:.4f}")
+
+def preprocess_frame(frame, target_shape):
+    # Convert from BGR (OpenCV) to RGB (model)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # OpenCV resize wants (width, height)
+    width, height = target_shape[1], target_shape[0]
+    frame_resized = cv2.resize(frame_rgb, (width, height), interpolation=cv2.INTER_AREA)
+    # Normalize to [-1, +1]
+    img = frame_resized.astype(np.float32)
+    img = (img / 127.5) - 1.0
+    # Add batch dim
+    return np.expand_dims(img, axis=0)
+
+
+
+def run_inference(model, frame, labels):
+    input_tensor = preprocess_frame(frame, model.input_shape[1:3])
+    preds = model.predict(input_tensor)[0]
+    print("Raw softmax scores:", preds)           # <-- for debugging
+    idx = np.argmax(preds)
+    return labels[idx], float(preds[idx])
+
+
+def main(args):
+    # Resolve paths relative to this script
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = args.model if os.path.isabs(args.model) else os.path.join(base_dir, args.model)
+    labels_path = args.labels if os.path.isabs(args.labels) else os.path.join(base_dir, args.labels)
+
+    print(f"Loading model from {model_path}")
+    model = tf.keras.models.load_model(model_path, compile=False)
+    labels = load_labels(labels_path)
+    print(f"Loaded {len(labels)} labels from {labels_path}")
+
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        print(f"Error: Could not open camera index {args.camera}")
+        sys.exit(1)
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error: Frame capture failed")
+                break
+
+            class_name, confidence = run_inference(model, frame, labels)
+            text = f"{class_name}: {confidence*100:.1f}%"
+            cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.imshow("Inference", frame)
+
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Real-time image classification with TensorFlow and OpenCV")
+    parser.add_argument("--model", type=str, default="keras_model.h5",
+                        help="Path to .h5 or SavedModel directory (relative to script)")
+    parser.add_argument("--labels", type=str, default="labels.txt",
+                        help="Path to labels text file (relative to script)")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="Camera device index")
+    args = parser.parse_args()
+    main(args)
