@@ -1,0 +1,5 @@
+0 Laptop Computer
+1 Desktop Computer
+2 Portable Console
+3 Stationary Console
+4 Portable Computer
